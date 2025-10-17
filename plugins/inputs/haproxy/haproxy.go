@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
+	"bufio"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/common/tls"
@@ -116,13 +118,138 @@ func (h *HAProxy) gatherServerSocket(addr string, acc telegraf.Accumulator) erro
 		return fmt.Errorf("could not connect to '%s://%s': %w", network, address, err)
 	}
 
+	// show stat
 	_, errw := c.Write([]byte("show stat\n"))
 	if errw != nil {
 		return fmt.Errorf("could not write to socket '%s://%s': %w", network, address, errw)
 	}
 
-	return h.importCsvResult(c, acc, address)
+	h.importCsvResult(c, acc, address)
+
+	// show servers state
+	c2, err := net.Dial(network, address)
+	if err != nil {
+		return fmt.Errorf("could not connect to '%s://%s' for 'show servers state': %w", network, address, err)
+	}
+	defer c2.Close()
+
+	_, errw2 := c2.Write([]byte("show servers state\n"))
+	if errw2 != nil {
+		return fmt.Errorf("could not write 'show servers state' to socket '%s://%s': %w", network, address, errw2)
+	}
+
+	if err := h.importServersStateResult(c2, acc, address); err != nil {
+		fmt.Printf("Warning: could not parse 'show servers state': %v\n", err)
+	}
+	return nil
 }
+
+func (h *HAProxy) importServersStateResult(r io.Reader, acc telegraf.Accumulator, host string) error {
+	scanner := bufio.NewScanner(r)
+	now := time.Now()
+	
+	var headers []string
+	
+	// Read header line
+	for scanner.Scan() {
+		line := scanner.Text()
+		
+		// ignore empty line
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		
+		// line start with # indicates header
+		if strings.HasPrefix(line, "#") {
+			// strimp '#' and split by whitespace
+			headerLine := strings.TrimPrefix(line, "#")
+			headerLine = strings.TrimSpace(headerLine)
+			headers = strings.Fields(headerLine)
+			fmt.Printf("Found %d headers: %v\n", len(headers), headers)
+			break
+		}
+		
+		// ignore line include version info
+		if strings.TrimSpace(line) == "1" {
+			fmt.Printf("Skipping version line: %s\n", line)
+			continue
+		}
+	}
+	
+	if len(headers) == 0 {
+		return errors.New("no header found in servers state")
+	}
+	
+	rowCount := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		
+		// ignore empty lines and comments
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// split line by whitespace
+		columns := strings.Fields(line)
+		
+		if len(columns) != len(headers) {
+			fmt.Printf("Warning: row has %d columns, expected %d. Line: %s\n", 
+				len(columns), len(headers), line)
+			continue
+		}
+		
+		fields := make(map[string]interface{})
+		tags := map[string]string{
+			"server": host,
+		}
+		
+		for j, value := range columns {
+			if value == "" || value == "-" {
+				continue
+			}
+			
+			colName := headers[j]
+			
+			switch colName {
+			case "be_name":
+				parts := strings.Split(value, ":")
+				if len(parts) == 2 {
+					tags["pool_id"] = parts[0]
+					tags["listener_id"] = parts[1]
+				} else {
+					tags["be_id"] = value
+				}
+			case "srv_name":
+				tags["member_id"] = value
+			case "srv_fqdn", "srvrecord", "srv_addr", "srv_port":
+				tags[colName] = value
+			case "be_id", "srv_id":
+				continue
+			case "srv_check_addr", "srv_agent_addr":
+				if value != "-" {
+					fields[colName] = value
+				}
+			case "srv_op_state":
+				fieldName := "member_health_status"
+				fields[fieldName] = value
+			default:
+				//ignore import csv other string fields
+			    continue	
+			}
+		}
+		
+		acc.AddFields("haproxy_servers_state", fields, tags, now)
+		rowCount++
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error scanning servers state: %w", err)
+	}
+	
+	fmt.Printf("Successfully processed %d server state rows\n", rowCount)
+	return nil
+}
+
 
 func (h *HAProxy) gatherServer(addr string, acc telegraf.Accumulator) error {
 	if !strings.HasPrefix(addr, "http") {
