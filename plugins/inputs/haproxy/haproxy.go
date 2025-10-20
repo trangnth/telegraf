@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"bytes"
 	"bufio"
 
 	"github.com/influxdata/telegraf"
